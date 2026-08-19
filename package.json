@@ -1,0 +1,13 @@
+{
+  "name": "automazione-foto-imagemagick",
+  "version": "1.0.0",
+  "description": "Motore fotografico ImageMagick per automazione foto GPT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
