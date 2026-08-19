@@ -1,18 +1,53 @@
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
+const os = require("os");
 const crypto = require("crypto");
 const { execFile } = require("child_process");
 
 const app = express();
-const upload = multer({ dest: os.tmpdir() });
 
 const PORT = process.env.PORT || 3000;
 
-// Stato temporaneo dei lavori
+
+// ============================================================
+// UPLOAD TEMPORANEI
+// ============================================================
+
+const upload = multer({
+  dest: os.tmpdir(),
+
+  limits: {
+    fileSize: 80 * 1024 * 1024
+  }
+});
+
+
+// ============================================================
+// JOB IN MEMORIA
+// ============================================================
+
 const jobs = new Map();
+
+
+// ============================================================
+// UTILITY
+// ============================================================
+
+function clamp(value, min, max, fallback) {
+
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+
+  return Math.max(
+    min,
+    Math.min(max, n)
+  );
+}
 
 
 // ============================================================
@@ -20,335 +55,799 @@ const jobs = new Map();
 // ============================================================
 
 app.get("/", (req, res) => {
+
   res.json({
     ok: true,
     service: "automazione-foto-imagemagick",
     message: "ImageMagick service online",
-    async: true
+    async: true,
+    advancedControls: true
   });
 });
 
 
 // ============================================================
-// FUNZIONE IMAGEMAGICK
+// SVILUPPO IMMAGINE
 // ============================================================
 
-function developImage(inputPath, outputPath, values) {
+function developImage(
+  inputPath,
+  outputPath,
+  values
+) {
 
-  return new Promise((resolve, reject) => {
+  return new Promise(
+    (resolve, reject) => {
 
-    const {
-      brightness,
-      saturation,
-      contrast,
-      gamma,
-      temperature,
-      tint,
-      sharpen,
-      quality
-    } = values;
+      // ------------------------------------------------------
+      // PARAMETRI BASE
+      // ------------------------------------------------------
 
-    const args = [
-      inputPath,
-
-      "-auto-orient",
-
-      "-colorspace",
-      "sRGB",
-
-      "-modulate",
-      `${brightness},${saturation},100`,
-
-      "-gamma",
-      String(gamma),
-    ];
-
-
-    // --------------------------------------------------------
-    // CONTRASTO
-    // --------------------------------------------------------
-
-    if (contrast !== 0) {
-
-      const slope =
-        Math.max(
-          0.8,
-          Math.min(
-            1.25,
-            1 + contrast / 100
-          )
+      const brightness =
+        clamp(
+          values.brightness,
+          85,
+          120,
+          100
         );
 
-      const intercept =
-        (1 - slope) / 2;
+      const gamma =
+        clamp(
+          values.gamma,
+          0.75,
+          1.25,
+          1
+        );
 
-      args.push(
-        "-evaluate",
-        "Multiply",
-        String(slope),
+      const contrast =
+        clamp(
+          values.contrast,
+          -20,
+          20,
+          0
+        );
 
-        "-evaluate",
-        "Add",
-        String(intercept)
-      );
-    }
+      const saturation =
+        clamp(
+          values.saturation,
+          75,
+          125,
+          100
+        );
 
+      const temperature =
+        clamp(
+          values.temperature,
+          -80,
+          80,
+          0
+        );
 
-    // --------------------------------------------------------
-    // TEMPERATURA
-    // --------------------------------------------------------
+      const tint =
+        clamp(
+          values.tint,
+          -60,
+          60,
+          0
+        );
 
-    if (temperature !== 0) {
-
-      const amount =
-        Math.max(
-          -100,
-          Math.min(
-            100,
-            temperature
-          )
+      const sharpen =
+        clamp(
+          values.sharpen,
+          0,
+          1.5,
+          0.3
         );
 
 
-      // più fredda
-      if (amount < 0) {
+      // ------------------------------------------------------
+      // NUOVI CONTROLLI
+      // ------------------------------------------------------
 
-        const cool =
-          Math.abs(amount) / 100;
+      const shadows =
+        clamp(
+          values.shadows,
+          -50,
+          50,
+          0
+        );
+
+      const highlights =
+        clamp(
+          values.highlights,
+          -50,
+          50,
+          0
+        );
+
+      const whites =
+        clamp(
+          values.whites,
+          -30,
+          30,
+          0
+        );
+
+      const blacks =
+        clamp(
+          values.blacks,
+          -30,
+          30,
+          0
+        );
+
+      const vibrance =
+        clamp(
+          values.vibrance,
+          -30,
+          30,
+          0
+        );
+
+      const quality =
+        clamp(
+          values.quality,
+          80,
+          100,
+          95
+        );
+
+
+      // ======================================================
+      // CONVERSIONI
+      //
+      // I nuovi cursori non esistono 1:1 in ImageMagick
+      // come in Lightroom.
+      //
+      // Li traduciamo in curve/levels selettivi.
+      // ======================================================
+
+
+      // ------------------------------------------------------
+      // SHADOWS
+      //
+      // Valore positivo:
+      // apre i mezzi toni bassi.
+      //
+      // Valore negativo:
+      // li chiude.
+      //
+      // Usiamo sigmoidal contrast con midpoint basso.
+      // ------------------------------------------------------
+
+      const shadowsStrength =
+        Math.abs(shadows) *
+        0.10;
+
+
+      // ------------------------------------------------------
+      // HIGHLIGHTS
+      //
+      // Valore negativo:
+      // recupera/comprime le alte luci.
+      //
+      // Valore positivo:
+      // le rende più brillanti.
+      // ------------------------------------------------------
+
+      const highlightsStrength =
+        Math.abs(highlights) *
+        0.10;
+
+
+      // ------------------------------------------------------
+      // BLACKS / WHITES
+      //
+      // Tradotti in level.
+      //
+      // blacks positivo = neri più sollevati
+      // blacks negativo = neri più profondi
+      //
+      // whites positivo = bianchi più luminosi
+      // whites negativo = bianchi più contenuti
+      // ------------------------------------------------------
+
+      let blackPoint =
+        0;
+
+      let whitePoint =
+        100;
+
+
+      if (blacks < 0) {
+
+        blackPoint =
+          Math.abs(blacks) *
+          0.10;
+      }
+
+      if (blacks > 0) {
+
+        blackPoint =
+          -blacks *
+          0.05;
+      }
+
+
+      if (whites > 0) {
+
+        whitePoint =
+          100 -
+          whites * 0.10;
+      }
+
+      if (whites < 0) {
+
+        whitePoint =
+          100 +
+          Math.abs(whites) *
+          0.05;
+      }
+
+
+      blackPoint =
+        Math.max(
+          -3,
+          Math.min(
+            6,
+            blackPoint
+          )
+        );
+
+
+      whitePoint =
+        Math.max(
+          94,
+          Math.min(
+            103,
+            whitePoint
+          )
+        );
+
+
+      // ------------------------------------------------------
+      // TEMPERATURA
+      //
+      // Regolazione RGB conservativa.
+      // ------------------------------------------------------
+
+      const tempRed =
+        100 +
+        temperature * 0.25;
+
+      const tempBlue =
+        100 -
+        temperature * 0.25;
+
+
+      // ------------------------------------------------------
+      // TINT
+      //
+      // Magenta/verde tramite canale Green.
+      //
+      // tint positivo = magenta
+      // -> riduciamo leggermente il verde.
+      //
+      // tint negativo = verde
+      // -> aumentiamo leggermente il verde.
+      // ------------------------------------------------------
+
+      const greenFactor =
+        100 -
+        tint * 0.18;
+
+
+      // ------------------------------------------------------
+      // VIBRANCE
+      //
+      // ImageMagick non offre un cursore Lightroom Vibrance
+      // identico.
+      //
+      // Usiamo una saturazione secondaria molto moderata.
+      // ------------------------------------------------------
+
+      const vibranceSaturation =
+        100 +
+        vibrance * 0.40;
+
+
+      // ======================================================
+      // ARGOMENTI IMAGEMAGICK
+      // ======================================================
+
+      const args = [
+
+        inputPath,
+
+        "-auto-orient",
+
+        "-colorspace",
+        "sRGB"
+      ];
+
+
+      // ======================================================
+      // 1. TEMPERATURA
+      // ======================================================
+
+      if (temperature !== 0) {
 
         args.push(
           "-channel",
           "R",
-
           "-evaluate",
-          "Multiply",
-          String(
-            1 - cool * 0.10
-          ),
+          "multiply",
+          String(tempRed / 100),
 
           "-channel",
           "B",
-
           "-evaluate",
-          "Multiply",
-          String(
-            1 + cool * 0.14
-          ),
-
-          "+channel"
-        );
-
-      }
-
-      // più calda
-      else {
-
-        const warm =
-          amount / 100;
-
-        args.push(
-          "-channel",
-          "R",
-
-          "-evaluate",
-          "Multiply",
-          String(
-            1 + warm * 0.12
-          ),
-
-          "-channel",
-          "B",
-
-          "-evaluate",
-          "Multiply",
-          String(
-            1 - warm * 0.10
-          ),
+          "multiply",
+          String(tempBlue / 100),
 
           "+channel"
         );
       }
-    }
 
 
-    // --------------------------------------------------------
-    // TINT
-    // --------------------------------------------------------
+      // ======================================================
+      // 2. TINT
+      // ======================================================
 
-    if (tint !== 0) {
-
-      const amount =
-        Math.max(
-          -100,
-          Math.min(
-            100,
-            tint
-          )
-        );
-
-
-      // magenta
-      if (amount > 0) {
-
-        const magenta =
-          amount / 100;
+      if (tint !== 0) {
 
         args.push(
           "-channel",
           "G",
-
           "-evaluate",
-          "Multiply",
-          String(
-            1 - magenta * 0.10
-          ),
-
-          "+channel"
-        );
-
-      }
-
-      // verde
-      else {
-
-        const green =
-          Math.abs(amount) / 100;
-
-        args.push(
-          "-channel",
-          "G",
-
-          "-evaluate",
-          "Multiply",
-          String(
-            1 + green * 0.10
-          ),
-
+          "multiply",
+          String(greenFactor / 100),
           "+channel"
         );
       }
-    }
 
 
-    // --------------------------------------------------------
-    // NITIDEZZA
-    // --------------------------------------------------------
+      // ======================================================
+      // 3. SHADOWS
+      // ======================================================
 
-    if (sharpen > 0) {
+      if (shadows !== 0) {
 
-      args.push(
-        "-unsharp",
-        `0x${sharpen}+0.7+0.02`
-      );
-    }
+        if (shadows > 0) {
 
-
-    // --------------------------------------------------------
-    // OUTPUT JPEG
-    // --------------------------------------------------------
-
-    args.push(
-      "-quality",
-      String(quality),
-
-      outputPath
-    );
-
-
-    execFile(
-      "convert",
-      args,
-      (error, stdout, stderr) => {
-
-        if (error) {
-          reject(
-            new Error(
-              stderr ||
-              error.message
-            )
+          // Apri le ombre.
+          args.push(
+            "+sigmoidal-contrast",
+            `${shadowsStrength}x30%`
           );
 
-          return;
-        }
+        } else {
 
-        resolve();
+          // Chiudi le ombre.
+          args.push(
+            "-sigmoidal-contrast",
+            `${shadowsStrength}x30%`
+          );
+        }
+      }
+
+
+      // ======================================================
+      // 4. HIGHLIGHTS
+      // ======================================================
+
+      if (highlights !== 0) {
+
+        if (highlights < 0) {
+
+          // Recupera / comprime alte luci.
+          args.push(
+            "+sigmoidal-contrast",
+            `${highlightsStrength}x70%`
+          );
+
+        } else {
+
+          // Aumenta brillantezza alte luci.
+          args.push(
+            "-sigmoidal-contrast",
+            `${highlightsStrength}x70%`
+          );
+        }
+      }
+
+
+      // ======================================================
+      // 5. WHITES / BLACKS
+      // ======================================================
+
+      if (
+        whites !== 0 ||
+        blacks !== 0
+      ) {
+
+        args.push(
+          "-level",
+          `${blackPoint}%,${whitePoint}%`
+        );
+      }
+
+
+      // ======================================================
+      // 6. BRIGHTNESS + SATURATION
+      // ======================================================
+
+      args.push(
+        "-modulate",
+        `${brightness},${saturation},100`
+      );
+
+
+      // ======================================================
+      // 7. VIBRANCE
+      // ======================================================
+
+      if (vibrance !== 0) {
+
+        args.push(
+          "-modulate",
+          `100,${vibranceSaturation},100`
+        );
+      }
+
+
+      // ======================================================
+      // 8. GAMMA
+      // ======================================================
+
+      if (gamma !== 1) {
+
+        args.push(
+          "-gamma",
+          String(gamma)
+        );
+      }
+
+
+      // ======================================================
+      // 9. CONTRASTO
+      //
+      // Sigmoidal è più fotografico rispetto
+      // al contrasto lineare.
+      // ======================================================
+
+      if (contrast !== 0) {
+
+        const contrastStrength =
+          Math.abs(contrast) *
+          0.25;
+
+
+        if (contrast > 0) {
+
+          args.push(
+            "-sigmoidal-contrast",
+            `${contrastStrength}x50%`
+          );
+
+        } else {
+
+          args.push(
+            "+sigmoidal-contrast",
+            `${contrastStrength}x50%`
+          );
+        }
+      }
+
+
+      // ======================================================
+      // 10. SHARPEN
+      // ======================================================
+
+      if (sharpen > 0) {
+
+        args.push(
+          "-unsharp",
+          `0x${sharpen}+0.7+0.02`
+        );
+      }
+
+
+      // ======================================================
+      // 11. JPEG
+      // ======================================================
+
+      args.push(
+        "-quality",
+        String(quality),
+
+        outputPath
+      );
+
+
+      console.log(
+        "ImageMagick params:",
+        {
+          brightness,
+          gamma,
+          contrast,
+          saturation,
+          temperature,
+          tint,
+          shadows,
+          highlights,
+          whites,
+          blacks,
+          vibrance,
+          sharpen,
+          quality
+        }
+      );
+
+
+      execFile(
+        "convert",
+        args,
+        {
+          maxBuffer:
+            20 * 1024 * 1024
+        },
+
+        (error, stdout, stderr) => {
+
+          if (error) {
+
+            console.error(
+              "ImageMagick error:",
+              error
+            );
+
+            console.error(
+              "ImageMagick stderr:",
+              stderr
+            );
+
+            reject(
+              new Error(
+                stderr ||
+                error.message
+              )
+            );
+
+            return;
+          }
+
+
+          resolve();
+        }
+      );
+    }
+  );
+}
+
+
+// ============================================================
+// DROPBOX UPLOAD
+// ============================================================
+
+async function uploadToDropbox(
+  accessToken,
+  destinationPath,
+  outputBuffer
+) {
+
+  const response =
+    await fetch(
+      "https://content.dropboxapi.com/2/files/upload",
+      {
+        method: "POST",
+
+        headers: {
+
+          Authorization:
+            `Bearer ${accessToken}`,
+
+          "Content-Type":
+            "application/octet-stream",
+
+          "Dropbox-API-Arg":
+            JSON.stringify({
+
+              path:
+                destinationPath,
+
+              mode:
+                "overwrite",
+
+              autorename:
+                false,
+
+              mute:
+                true
+            })
+        },
+
+        body:
+          outputBuffer
       }
     );
-  });
+
+
+  const data =
+    await response.json();
+
+
+  if (!response.ok) {
+
+    throw new Error(
+      "Dropbox upload error: " +
+      JSON.stringify(data)
+    );
+  }
+
+
+  return data;
+}
+
+
+// ============================================================
+// NORMALIZZA PARAMETRI
+// ============================================================
+
+function normalizeValues(body) {
+
+  return {
+
+    brightness:
+      clamp(
+        body.brightness,
+        85,
+        120,
+        100
+      ),
+
+    gamma:
+      clamp(
+        body.gamma,
+        0.75,
+        1.25,
+        1
+      ),
+
+    contrast:
+      clamp(
+        body.contrast,
+        -20,
+        20,
+        0
+      ),
+
+    saturation:
+      clamp(
+        body.saturation,
+        75,
+        125,
+        100
+      ),
+
+    temperature:
+      clamp(
+        body.temperature,
+        -80,
+        80,
+        0
+      ),
+
+    tint:
+      clamp(
+        body.tint,
+        -60,
+        60,
+        0
+      ),
+
+    shadows:
+      clamp(
+        body.shadows,
+        -50,
+        50,
+        0
+      ),
+
+    highlights:
+      clamp(
+        body.highlights,
+        -50,
+        50,
+        0
+      ),
+
+    whites:
+      clamp(
+        body.whites,
+        -30,
+        30,
+        0
+      ),
+
+    blacks:
+      clamp(
+        body.blacks,
+        -30,
+        30,
+        0
+      ),
+
+    vibrance:
+      clamp(
+        body.vibrance,
+        -30,
+        30,
+        0
+      ),
+
+    sharpen:
+      clamp(
+        body.sharpen,
+        0,
+        1.5,
+        0.3
+      ),
+
+    quality:
+      clamp(
+        body.quality,
+        80,
+        100,
+        95
+      )
+  };
 }
 
 
 // ============================================================
 // VECCHIO ENDPOINT SINCRONO
-// Lo lasciamo disponibile per test.
+// Rimane per compatibilità/test.
 // ============================================================
 
 app.post(
   "/develop",
+
   upload.single("image"),
+
   async (req, res) => {
 
-    if (!req.file) {
-      return res.status(400).json({
-        error: "Immagine mancante"
-      });
-    }
-
-    const inputPath =
-      req.file.path;
-
-    const outputPath =
-      path.join(
-        os.tmpdir(),
-        `output-${Date.now()}.jpg`
-      );
-
-
-    const values = {
-
-      brightness:
-        Number(
-          req.body.brightness ?? 100
-        ),
-
-      saturation:
-        Number(
-          req.body.saturation ?? 100
-        ),
-
-      contrast:
-        Number(
-          req.body.contrast ?? 0
-        ),
-
-      gamma:
-        Number(
-          req.body.gamma ?? 1
-        ),
-
-      temperature:
-        Number(
-          req.body.temperature ?? 0
-        ),
-
-      tint:
-        Number(
-          req.body.tint ?? 0
-        ),
-
-      sharpen:
-        Number(
-          req.body.sharpen ?? 0.4
-        ),
-
-      quality:
-        Number(
-          req.body.quality ?? 95
-        )
-    };
+    let inputPath = null;
+    let outputPath = null;
 
 
     try {
+
+      if (!req.file) {
+
+        return res.status(400).json({
+          ok: false,
+          error: "Image missing"
+        });
+      }
+
+
+      inputPath =
+        req.file.path;
+
+
+      outputPath =
+        path.join(
+          os.tmpdir(),
+          `${crypto.randomUUID()}.jpg`
+        );
+
+
+      const values =
+        normalizeValues(
+          req.body
+        );
+
 
       await developImage(
         inputPath,
@@ -357,14 +856,32 @@ app.post(
       );
 
 
-      res.setHeader(
+      const stat =
+        fs.statSync(
+          outputPath
+        );
+
+
+      if (
+        stat.size <
+        50 * 1024
+      ) {
+
+        throw new Error(
+          "Output JPEG troppo piccolo."
+        );
+      }
+
+
+      res.set(
         "Content-Type",
         "image/jpeg"
       );
 
-      res.setHeader(
-        "Content-Disposition",
-        'inline; filename="developed.jpg"'
+
+      res.set(
+        "Content-Length",
+        String(stat.size)
       );
 
 
@@ -383,13 +900,13 @@ app.post(
 
           try {
             fs.unlinkSync(
-              inputPath
+              outputPath
             );
           } catch {}
 
           try {
             fs.unlinkSync(
-              outputPath
+              inputPath
             );
           } catch {}
         }
@@ -398,57 +915,81 @@ app.post(
 
     } catch (error) {
 
+      console.error(
+        "SYNC ERROR:",
+        error
+      );
+
+
       try {
-        fs.unlinkSync(
-          inputPath
-        );
+
+        if (
+          inputPath &&
+          fs.existsSync(inputPath)
+        ) {
+
+          fs.unlinkSync(
+            inputPath
+          );
+        }
+
       } catch {}
 
+
       try {
-        fs.unlinkSync(
-          outputPath
-        );
+
+        if (
+          outputPath &&
+          fs.existsSync(outputPath)
+        ) {
+
+          fs.unlinkSync(
+            outputPath
+          );
+        }
+
       } catch {}
 
 
-      return res
-        .status(500)
-        .json({
-          error:
-            "Errore ImageMagick",
-
-          detail:
-            error.message
-        });
+      res.status(500).json({
+        ok: false,
+        error:
+          error.message
+      });
     }
   }
 );
 
 
 // ============================================================
-// NUOVO ENDPOINT ASINCRONO
-// Render risponde subito e poi lavora in background.
+// ENDPOINT ASINCRONO
 // ============================================================
 
 app.post(
   "/develop-async",
+
   upload.single("image"),
+
   async (req, res) => {
 
     if (!req.file) {
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "Immagine mancante"
-        });
+
+      return res.status(400).json({
+        ok: false,
+        error: "Image missing"
+      });
     }
 
 
-    if (
-      !req.body.dropboxToken ||
-      !req.body.destinationPath
-    ) {
+    const dropboxToken =
+      req.body.dropboxToken;
+
+
+    const destinationPath =
+      req.body.destinationPath;
+
+
+    if (!dropboxToken) {
 
       try {
         fs.unlinkSync(
@@ -457,13 +998,26 @@ app.post(
       } catch {}
 
 
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error:
-            "Dropbox token o destinationPath mancante"
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "dropboxToken missing"
+      });
+    }
+
+
+    if (!destinationPath) {
+
+      try {
+        fs.unlinkSync(
+          req.file.path
+        );
+      } catch {}
+
+
+      return res.status(400).json({
+        ok: false,
+        error: "destinationPath missing"
+      });
     }
 
 
@@ -478,74 +1032,34 @@ app.post(
     const outputPath =
       path.join(
         os.tmpdir(),
-        `output-${jobId}.jpg`
+        `${jobId}.jpg`
       );
 
 
-    const values = {
-
-      brightness:
-        Number(
-          req.body.brightness ?? 100
-        ),
-
-      saturation:
-        Number(
-          req.body.saturation ?? 100
-        ),
-
-      contrast:
-        Number(
-          req.body.contrast ?? 0
-        ),
-
-      gamma:
-        Number(
-          req.body.gamma ?? 1
-        ),
-
-      temperature:
-        Number(
-          req.body.temperature ?? 0
-        ),
-
-      tint:
-        Number(
-          req.body.tint ?? 0
-        ),
-
-      sharpen:
-        Number(
-          req.body.sharpen ?? 0.4
-        ),
-
-      quality:
-        Number(
-          req.body.quality ?? 95
-        )
-    };
-
-
-    const dropboxToken =
-      req.body.dropboxToken;
-
-
-    const destinationPath =
-      req.body.destinationPath;
+    const values =
+      normalizeValues(
+        req.body
+      );
 
 
     jobs.set(
       jobId,
       {
+        ok: true,
+        jobId,
         status: "processing",
         destinationPath,
-        startedAt:
-          new Date().toISOString()
+        createdAt:
+          new Date().toISOString(),
+        values
       }
     );
 
 
-    // Risposta IMMEDIATA a Cloudflare
+    // ========================================================
+    // RISPONDI SUBITO
+    // ========================================================
+
     res.status(202).json({
       ok: true,
       jobId,
@@ -555,15 +1069,15 @@ app.post(
 
 
     // ========================================================
-    // DA QUI RENDER CONTINUA DA SOLO
+    // PROCESSA DOPO LA RISPOSTA
     // ========================================================
 
     try {
 
       console.log(
-        "JOB",
+        "START JOB",
         jobId,
-        "ImageMagick avviato"
+        destinationPath
       );
 
 
@@ -574,148 +1088,123 @@ app.post(
       );
 
 
-      const finalBytes =
-        fs.readFileSync(
+      const stat =
+        fs.statSync(
           outputPath
         );
 
 
       if (
-        finalBytes.length <
-        50000
+        stat.size <
+        50 * 1024
       ) {
 
         throw new Error(
-          "JPEG finale troppo piccolo"
+          "JPEG finale troppo piccolo: " +
+          stat.size +
+          " bytes"
         );
       }
 
 
-      console.log(
-        "JOB",
-        jobId,
-        "ImageMagick completato:",
-        finalBytes.length,
-        "bytes"
-      );
-
-
-      // ======================================================
-      // UPLOAD DIRETTO SU DROPBOX
-      // ======================================================
-
-      const uploadResponse =
-        await fetch(
-          "https://content.dropboxapi.com/2/files/upload",
-          {
-            method: "POST",
-
-            headers: {
-
-              Authorization:
-                `Bearer ${dropboxToken}`,
-
-              "Content-Type":
-                "application/octet-stream",
-
-              "Dropbox-API-Arg":
-                JSON.stringify({
-
-                  path:
-                    destinationPath,
-
-                  mode:
-                    "overwrite",
-
-                  autorename:
-                    false,
-
-                  mute:
-                    true,
-
-                  strict_conflict:
-                    false
-                })
-            },
-
-            body:
-              finalBytes
-          }
+      const outputBuffer =
+        fs.readFileSync(
+          outputPath
         );
 
 
-      if (!uploadResponse.ok) {
-
-        throw new Error(
-          "Upload Dropbox fallito: " +
-          await uploadResponse.text()
+      const dropboxResult =
+        await uploadToDropbox(
+          dropboxToken,
+          destinationPath,
+          outputBuffer
         );
-      }
 
 
       jobs.set(
         jobId,
         {
-          status:
-            "completed",
-
+          ok: true,
+          jobId,
+          status: "completed",
           destinationPath,
-
           finalSize:
-            finalBytes.length,
-
+            stat.size,
+          dropboxPath:
+            dropboxResult.path_display ||
+            destinationPath,
           completedAt:
-            new Date().toISOString()
+            new Date().toISOString(),
+          values
         }
       );
 
 
       console.log(
-        "JOB",
+        "JOB COMPLETED",
         jobId,
-        "COMPLETATO"
+        stat.size,
+        "bytes"
       );
 
 
     } catch (error) {
 
       console.error(
-        "JOB",
+        "ASYNC JOB ERROR",
         jobId,
-        "ERRORE:",
-        error.message
+        error
       );
 
 
       jobs.set(
         jobId,
         {
-          status:
-            "error",
-
+          ok: true,
+          jobId,
+          status: "error",
           destinationPath,
-
           error:
             error.message,
-
           completedAt:
-            new Date().toISOString()
+            new Date().toISOString(),
+          values
         }
       );
 
+
     } finally {
 
+
       try {
-        fs.unlinkSync(
-          inputPath
-        );
+
+        if (
+          fs.existsSync(
+            inputPath
+          )
+        ) {
+
+          fs.unlinkSync(
+            inputPath
+          );
+        }
+
       } catch {}
 
 
       try {
-        fs.unlinkSync(
-          outputPath
-        );
+
+        if (
+          fs.existsSync(
+            outputPath
+          )
+        ) {
+
+          fs.unlinkSync(
+            outputPath
+          );
+        }
+
       } catch {}
     }
   }
@@ -723,48 +1212,54 @@ app.post(
 
 
 // ============================================================
-// STATO DI UN JOB
+// STATO JOB
 // ============================================================
 
 app.get(
   "/job/:id",
+
   (req, res) => {
+
+    const jobId =
+      req.params.id;
+
 
     const job =
       jobs.get(
-        req.params.id
+        jobId
       );
 
 
     if (!job) {
 
-      return res
-        .status(404)
-        .json({
-          ok: false,
-          error:
-            "Job non trovato"
-        });
+      return res.status(404).json({
+        ok: false,
+        error:
+          "Job not found"
+      });
     }
 
 
-    return res.json({
-      ok: true,
-      jobId:
-        req.params.id,
-      ...job
-    });
+    res.set(
+      "Cache-Control",
+      "no-store"
+    );
+
+
+    return res.json(
+      job
+    );
   }
 );
 
 
 // ============================================================
-// SERVER
+// AVVIO SERVER
 // ============================================================
 
 app.listen(
   PORT,
-  "0.0.0.0",
+
   () => {
 
     console.log(
